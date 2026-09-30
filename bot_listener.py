@@ -1,39 +1,63 @@
+"""Telegram Bot Listener for Gmail Draft Management and Batch Trashing.
+
+This module listens for Telegram updates to enable human-in-the-loop email workflows:
+1. Attaches documents sent to the bot directly to corresponding Gmail drafts.
+2. Handles inline button callbacks to send or preserve Gmail drafts.
+3. Performs batch deletion of promotional emails queued in local JSON storage.
+"""
+
 import base64
 from email import message_from_bytes
 import json
 import mimetypes
 import os
 import time
+from typing import List, Optional
 
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
+from googleapiclient.discovery import Resource, build
 import requests
 
 load_dotenv()
 
-SCOPES = ["https://mail.google.com/"]
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().strip('"').strip("'")
+# --- Configuration ---
+SCOPES: List[str] = ["https://mail.google.com/"]
+BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().strip('"').strip("'")
 if BOT_TOKEN.startswith("bot"):
     BOT_TOKEN = BOT_TOKEN[3:]
 
-creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-gmail_service = build("gmail", "v1", credentials=creds)
+creds: Credentials = Credentials.from_authorized_user_file("token.json", SCOPES)
+gmail_service: Resource = build("gmail", "v1", credentials=creds)
 
-latest_active_draft_id = None
+latest_active_draft_id: Optional[str] = None
 
 
-def answer_callback(callback_query_id: str, text: str):
+def answer_callback(callback_query_id: str, text: str) -> None:
+    """Acknowledges an incoming Telegram callback query with a pop-up alert or toast.
+
+    Args:
+        callback_query_id: Unique identifier for the callback query to be answered.
+        text: Text to display to the user in the Telegram UI.
+    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
     try:
         requests.post(
-            url, json={"callback_query_id": callback_query_id, "text": text}, timeout=10
+            url,
+            json={"callback_query_id": callback_query_id, "text": text},
+            timeout=10,
         )
     except Exception as e:
         print(f"Callback answer error: {e}")
 
 
-def send_bot_message(chat_id: int, text: str):
+def send_bot_message(chat_id: int, text: str) -> None:
+    """Dispatches a standard text message to a specific Telegram chat.
+
+    Args:
+        chat_id: Unique identifier for the target Telegram chat.
+        text: Text content of the message to be sent.
+    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
@@ -41,7 +65,14 @@ def send_bot_message(chat_id: int, text: str):
         print(f"Send message error: {e}")
 
 
-def update_message(chat_id: int, message_id: int, new_text: str):
+def update_message(chat_id: int, message_id: int, new_text: str) -> None:
+    """Edits the text of an existing Telegram message using Markdown formatting.
+
+    Args:
+        chat_id: Unique identifier for the target Telegram chat.
+        message_id: Identifier of the message to edit.
+        new_text: Updated Markdown message content.
+    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     try:
         requests.post(
@@ -58,7 +89,23 @@ def update_message(chat_id: int, message_id: int, new_text: str):
         print(f"Update message error: {e}")
 
 
-def attach_file_to_draft(draft_id: str, file_path: str, original_filename: str) -> bool:
+def attach_file_to_draft(
+    draft_id: str, file_path: str, original_filename: str
+) -> bool:
+    """Appends a local file as an attachment to an existing Gmail draft.
+
+    Retrieves the raw email content of the draft, rebuilds it as a multipart
+    MIME message with the added attachment, and updates the draft in Gmail.
+
+    Args:
+        draft_id: The ID of the Gmail draft to modify.
+        file_path: Local filesystem path of the temporary file to attach.
+        original_filename: The original display name of the uploaded file.
+
+    Returns:
+        bool: True if the attachment was successfully added and the draft updated,
+            False otherwise.
+    """
     try:
         draft_meta = (
             gmail_service.users()
@@ -98,7 +145,18 @@ def attach_file_to_draft(draft_id: str, file_path: str, original_filename: str) 
         return False
 
 
-def start_listening():
+def start_listening() -> None:
+    """Runs a long-polling loop to process incoming updates from the Telegram Bot API.
+
+    Handles:
+    - Document uploads: Resolves the target draft (from reply context or last active draft),
+      downloads the file from Telegram, attaches it to the Gmail draft, and cleans up temp files.
+    - Inline callbacks:
+        - `send:<draft_id>`: Sends the draft via the Gmail API.
+        - `keep:<draft_id>`: Retains the draft in Gmail without sending.
+        - `trash_all`: Bulk-moves all queued promotional emails in `pending_trash.json`
+          to the Gmail Trash folder.
+    """
     global latest_active_draft_id
     print("🤖 Telegram Bot Listener with Batch Trash & Reply Support is active...")
     last_update_id = None
@@ -112,7 +170,7 @@ def start_listening():
             for update in res.get("result", []):
                 last_update_id = update["update_id"] + 1
 
-                # 1. Document Upload
+                # 1. Document Upload Handling
                 if "message" in update and "document" in update["message"]:
                     msg = update["message"]
                     chat_id = msg["chat"]["id"]
@@ -135,7 +193,8 @@ def start_listening():
                     if not target_draft_id:
                         send_bot_message(
                             chat_id,
-                            "⚠️ ఏ డ్రాఫ్ట్‌‌కి అటాచ్ చేయాలో గుర్తించలేకపోయాం. దయచేసి బాట్ పంపిన డ్రాఫ్ట్ మెసేజ్ కి 'Reply' ఇచ్చి ఫైల్ పంపండి.",
+                            "⚠️ Could not determine which draft to attach this file to. "
+                            "Please reply directly to the bot's draft message with your file.",
                         )
                         continue
 
@@ -159,12 +218,16 @@ def start_listening():
                     if success:
                         send_bot_message(
                             chat_id,
-                            f"📎 '{file_name}' draft కి add అయింది! ఇప్పుడు [ ✅ Send Reply ] బటన్ నొక్కండి.",
+                            f"📎 '{file_name}' attached to draft successfully! "
+                            "You can now tap [ ✅ Send Reply ].",
                         )
                     else:
-                        send_bot_message(chat_id, "⚠️ ఫైల్ అటాచ్ చేయలేకపోయాం.")
+                        send_bot_message(
+                            chat_id,
+                            "⚠️ Failed to attach the file to the Gmail draft.",
+                        )
 
-                # 2. Inline Action Buttons
+                # 2. Inline Action Button Handling
                 elif "callback_query" in update:
                     cb = update["callback_query"]
                     data = cb.get("data", "")
@@ -198,7 +261,7 @@ def start_listening():
                     elif data == "trash_all":
                         print("🗑️ Trash All request received from Telegram...")
                         if os.path.exists("pending_trash.json"):
-                            with open("pending_trash.json", "r") as f:
+                            with open("pending_trash.json", "r", encoding="utf-8") as f:
                                 trash_items = json.load(f)
 
                             count = 0

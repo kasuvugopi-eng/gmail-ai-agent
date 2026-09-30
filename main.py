@@ -1,15 +1,23 @@
+"""Automated Email Triage and Processing Agent.
+
+This module connects to the Gmail API to retrieve unread emails, uses a Google
+Gemini LLM via LangChain and LangGraph to classify messages (Promotional, Routine,
+or Sensitive), creates drafts or alerts as appropriate, and sends status reports
+to a designated Telegram chat.
+"""
+
 import base64
 from email.message import EmailMessage
 import json
 import os
 import time
-from typing import Literal, Optional, TypedDict
+from typing import Any, Dict, List, Literal, Optional, Set, TypedDict, Union
 
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
+from googleapiclient.discovery import Resource, build
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
@@ -19,56 +27,80 @@ import requests
 load_dotenv()
 
 # --- 1. CONFIGURATION & LOG TRACKING ---
-SCOPES = ["https://mail.google.com/"]
-LOG_FILE = "processed_ids.json"
-PENDING_TRASH_FILE = "pending_trash.json"
+SCOPES: List[str] = ["https://mail.google.com/"]
+LOG_FILE: str = "processed_ids.json"
+PENDING_TRASH_FILE: str = "pending_trash.json"
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().strip('"').strip("'")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().strip('"').strip("'")
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
 
 if TELEGRAM_BOT_TOKEN.startswith("bot"):
     TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN[3:]
 
 
-def load_processed_ids() -> set:
+def load_processed_ids() -> Set[str]:
+    """Loads previously processed email IDs from local JSON storage.
+
+    Returns:
+        Set[str]: A set of processed email IDs. Returns an empty set if the file
+            does not exist or encounters a decoding error.
+    """
     if os.path.exists(LOG_FILE):
         try:
-            with open(LOG_FILE, "r") as f:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
                 return set(json.load(f))
         except Exception:
             return set()
     return set()
 
 
-def save_processed_id(email_id: str):
+def save_processed_id(email_id: str) -> None:
+    """Persists a newly processed email ID to local JSON storage.
+
+    Args:
+        email_id: Unique identifier string of the processed email.
+    """
     ids = load_processed_ids()
     ids.add(email_id)
-    with open(LOG_FILE, "w") as f:
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
         json.dump(list(ids), f)
 
 
-def load_pending_trash() -> list:
+def load_pending_trash() -> List[Union[Dict[str, str], str]]:
+    """Loads emails queued for promotional trash deletion.
+
+    Returns:
+        List[Union[Dict[str, str], str]]: A list of promotional email records
+            or IDs pending deletion review.
+    """
     if os.path.exists(PENDING_TRASH_FILE):
         try:
-            with open(PENDING_TRASH_FILE, "r") as f:
+            with open(PENDING_TRASH_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return []
     return []
 
 
-def save_pending_trash(trash_list: list):
-    with open(PENDING_TRASH_FILE, "w") as f:
+def save_pending_trash(trash_list: List[Union[Dict[str, str], str]]) -> None:
+    """Saves the pending promotional trash list to local storage.
+
+    Args:
+        trash_list: A list containing email metadata dictionaries or email IDs.
+    """
+    with open(PENDING_TRASH_FILE, "w", encoding="utf-8") as f:
         json.dump(trash_list, f, indent=2)
 
 
 # --- 2. DATA SCHEMAS ---
 class EmailAnalysis(BaseModel):
+    """Pydantic model representing structured email classification output."""
+
     category: Literal["PROMOTIONAL", "ROUTINE", "SENSITIVE"] = Field(
         description="The classification category of the email."
     )
     priority: Literal["LOW", "MEDIUM", "HIGH"] = Field(
-        description="The priority of the email."
+        description="The priority level of the email."
     )
     summary: str = Field(
         description="A crisp 1-2 sentence summary of what the email is about."
@@ -76,6 +108,8 @@ class EmailAnalysis(BaseModel):
 
 
 class EmailState(TypedDict):
+    """Typed dictionary representing the shared state across the LangGraph pipeline."""
+
     email_id: str
     thread_id: str
     sender: str
@@ -86,7 +120,12 @@ class EmailState(TypedDict):
 
 
 # --- 3. TELEGRAM UTILITY FUNCTIONS ---
-def send_telegram_alert(text: str):
+def send_telegram_alert(text: str) -> None:
+    """Dispatches a plain text alert notification to Telegram.
+
+    Args:
+        text: Message body to be dispatched to the chat.
+    """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
     try:
@@ -97,7 +136,15 @@ def send_telegram_alert(text: str):
 
 def send_telegram_draft_review(
     sender: str, subject: str, draft_body: str, draft_id: str
-):
+) -> None:
+    """Sends draft reply details to Telegram with interactive action buttons.
+
+    Args:
+        sender: The email address of the original sender.
+        subject: The subject of the thread.
+        draft_body: The LLM-generated draft reply text.
+        draft_id: The Gmail draft ID used for inline button callback actions.
+    """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     message_text = (
         f"📝 NEW DRAFT CREATED IN GMAIL\n\n"
@@ -123,15 +170,27 @@ def send_telegram_draft_review(
         print(f"Telegram draft notification error: {e}")
 
 
-def send_telegram_trash_summary(all_trash_list: list):
+def send_telegram_trash_summary(all_trash_list: List[Union[Dict[str, str], str]]) -> Optional[Dict[str, Any]]:
+    """Sends a consolidated preview and bulk delete action for promotional emails.
+
+    Displays up to the first 15 queued emails with a markdown list and appends
+    an inline keyboard button allowing bulk deletion.
+
+    Args:
+        all_trash_list: List of queued promotional email dictionaries or IDs.
+
+    Returns:
+        Optional[Dict[str, Any]]: Telegram API response dictionary if successful,
+            or None if the list is empty or an error occurs.
+    """
     if not all_trash_list:
-        return
+        return None
 
     count = len(all_trash_list)
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     text = f"🗑️ *PENDING PROMOTIONAL EMAILS ({count} total)*\n\n"
-    
-    # మొదటి 15 ప్రివ్యూగా చూపించడం
+
+    # Display the first 15 emails as a preview
     for idx, item in enumerate(all_trash_list[:15], 1):
         if isinstance(item, dict):
             clean_subj = item.get("subject", "No Subject").replace("*", "").replace("_", "")
@@ -162,9 +221,19 @@ def send_telegram_trash_summary(all_trash_list: list):
         return res.json()
     except Exception as e:
         print(f"Telegram trash summary error: {e}")
+        return None
+
 
 # --- 4. GMAIL AUTHENTICATION & HELPERS ---
-def get_gmail_service():
+def get_gmail_service() -> Resource:
+    """Authenticates using OAuth 2.0 and constructs the Gmail API service client.
+
+    Refreshes expired credentials if a refresh token is present, or initiates a
+    local server flow using client secrets if no valid token exists.
+
+    Returns:
+        Resource: Authorized Google API client resource for Gmail v1.
+    """
     creds = None
     if os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
@@ -176,7 +245,7 @@ def get_gmail_service():
                 "credentials.json", SCOPES
             )
             creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as token:
+        with open("token.json", "w", encoding="utf-8") as token:
             token.write(creds.to_json())
     return build("gmail", "v1", credentials=creds)
 
@@ -184,7 +253,17 @@ def get_gmail_service():
 gmail_service = get_gmail_service()
 
 
-def create_raw_email(to: str, subject: str, message_text) -> str:
+def create_raw_email(to: str, subject: str, message_text: Any) -> str:
+    """Encodes an email message into a URL-safe base64 string for Gmail API.
+
+    Args:
+        to: Target recipient email address.
+        subject: Subject header of the email.
+        message_text: Email body text (string or list of content segments).
+
+    Returns:
+        str: URL-safe base64-encoded email payload.
+    """
     message = EmailMessage()
     if isinstance(message_text, list):
         clean_text = "\n".join(
@@ -201,7 +280,7 @@ def create_raw_email(to: str, subject: str, message_text) -> str:
 
 
 # --- 5. LLM SETUP ---
-llm = ChatGoogleGenerativeAI(model="gemini-3.8-flash")
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 classifier_llm = llm.with_structured_output(EmailAnalysis)
 
 classify_prompt = ChatPromptTemplate.from_template(
@@ -231,11 +310,22 @@ Draft:"""
 )
 draft_chain = draft_prompt | llm
 
-current_run_trash = []
+current_run_trash: List[Dict[str, str]] = []
 
 
 # --- 6. LANGGRAPH NODES ---
-def classify_node(state: EmailState) -> dict:
+def classify_node(state: EmailState) -> Dict[str, EmailAnalysis]:
+    """LangGraph node: Classifies incoming email into predefined categories.
+
+    Implements retry and exponential backoff logic for handling temporary
+    503 (Unavailable) and 429 (Resource Exhausted) errors from the LLM endpoint.
+
+    Args:
+        state: Current email graph state.
+
+    Returns:
+        Dict[str, EmailAnalysis]: Dictionary updating state with classification results.
+    """
     max_retries = 3
     delay = 5
 
@@ -272,7 +362,15 @@ def classify_node(state: EmailState) -> dict:
     return {"analysis": fallback}
 
 
-def trash_node(state: EmailState) -> dict:
+def trash_node(state: EmailState) -> Dict[str, Any]:
+    """LangGraph node: Queues promotional emails for bulk deletion review.
+
+    Args:
+        state: Current email graph state.
+
+    Returns:
+        Dict[str, Any]: Empty state update dictionary.
+    """
     global current_run_trash
     current_run_trash.append(
         {
@@ -285,7 +383,18 @@ def trash_node(state: EmailState) -> dict:
     return {}
 
 
-def draft_node(state: EmailState) -> dict:
+def draft_node(state: EmailState) -> Dict[str, str]:
+    """LangGraph node: Drafts an AI response and creates a Gmail draft.
+
+    Generates a reply using the draft chain, persists it in Gmail as an
+    associated thread draft, and alerts Telegram with an interactive approval card.
+
+    Args:
+        state: Current email graph state.
+
+    Returns:
+        Dict[str, str]: Dictionary updating state with the generated reply text.
+    """
     reply_res = draft_chain.invoke(
         {
             "sender": state["sender"],
@@ -334,7 +443,15 @@ def draft_node(state: EmailState) -> dict:
     return {"generated_reply": reply}
 
 
-def alert_node(state: EmailState) -> dict:
+def alert_node(state: EmailState) -> Dict[str, Any]:
+    """LangGraph node: Sends an alert for sensitive or high-risk emails.
+
+    Args:
+        state: Current email graph state.
+
+    Returns:
+        Dict[str, Any]: Empty state update dictionary.
+    """
     text = (
         f"🚨 SENSITIVE EMAIL ALERT\n\n"
         f"From: {state['sender']}\n"
@@ -347,6 +464,14 @@ def alert_node(state: EmailState) -> dict:
 
 
 def route_email(state: EmailState) -> str:
+    """Conditional edge router: Determines graph branch based on category.
+
+    Args:
+        state: Current email graph state containing the classification result.
+
+    Returns:
+        str: Next node key name ('trash', 'draft', 'alert', or END).
+    """
     category = state["analysis"].category
     if category == "PROMOTIONAL":
         return "trash"
@@ -378,7 +503,16 @@ agent = workflow.compile()
 
 
 # --- 8. RUN AGENT WITH ACCUMULATION ---
-def fetch_unprocessed_emails():
+def fetch_unprocessed_emails() -> List[Dict[str, str]]:
+    """Retrieves unread, unprocessed emails from the primary Gmail inbox.
+
+    Parses MIME components for plain text bodies, falling back to message
+    snippets when plain text parts are unavailable.
+
+    Returns:
+        List[Dict[str, str]]: A list of dictionaries containing email attributes
+            (email_id, thread_id, sender, subject, body).
+    """
     processed_ids = load_processed_ids()
     results = (
         gmail_service.users()
@@ -443,7 +577,13 @@ def fetch_unprocessed_emails():
     return email_data_list
 
 
-def run_agent():
+def run_agent() -> None:
+    """Executes the pipeline loop over unread emails.
+
+    Fetches unprocessed emails, invokes the compiled LangGraph workflow for each,
+    tracks processed IDs, merges pending promotional emails with previously queued
+    items, and dispatches a consolidated Telegram summary.
+    """
     global current_run_trash
     current_run_trash = []
 
@@ -468,8 +608,7 @@ def run_agent():
 
         time.sleep(2)
 
-    # 36 పాత మెయిల్స్ + కొత్త మెయిల్స్ అక్యుమ్యులేట్ చేయడం
-    
+    # Accumulate existing pending trash emails with emails processed in this run
     all_trash = load_pending_trash()
     existing_ids = {item["email_id"] if isinstance(item, dict) else item for item in all_trash}
 
