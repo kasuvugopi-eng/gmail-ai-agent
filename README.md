@@ -29,9 +29,9 @@ An intelligent, autonomous email workflow automation system built with **LangGra
 - **Data Validation:** Pydantic
 
 ---
+### 📁 Project Structure
 
-## 📁 Project Structure
-
+```text
 gmail_agent/
 │
 ├── run.py                # Unified entry-point: runs scanner loop & Telegram listener concurrently
