@@ -32,9 +32,9 @@ An intelligent, autonomous email workflow automation system built with **LangGra
 
 ## 📁 Project Structure
 
-```text
 gmail_agent/
 │
+├── run.py                # Unified entry-point: runs scanner loop & Telegram listener concurrently
 ├── main.py               # Core LangGraph pipeline: fetches, classifies, drafts, and notifies
 ├── bot_listener.py       # Telegram polling listener for buttons and file attachments
 ├── pyproject.toml        # Dependencies and environment metadata
@@ -42,7 +42,6 @@ gmail_agent/
 ├── .env.example          # Environment variables template
 ├── .gitignore            # Git exclusion rules for secrets and local state
 └── README.md             # Project documentation
-
 
 🚀 Setup & Installation
 1. Prerequisites
@@ -75,19 +74,13 @@ TELEGRAM_CHAT_ID=your_telegram_numeric_chat_id
 5. Google OAuth Setup
 Place your downloaded credentials.json in the root project directory. On the very first run, a browser tab will open asking for Gmail authorization. After approval, token.json will be generated automatically.
 
-🚦 Running the Agent
-Open two terminal windows to run both the pipeline agent and the Telegram listener concurrently:
+## 🚦 Running the Agent
 
-Terminal 1: Start Telegram Listener
-Keep this running in the background to handle button clicks and incoming attachment uploads:
+You can launch the entire service (both the periodic email scanner and the interactive Telegram listener) using the unified runner script:
 
-PowerShell
-uv run --active python bot_listener.py
-Terminal 2: Run Email Processor
-Execute the scanner to process unread emails incrementally:
+```powershell
+uv run --active python run.py
 
-PowerShell
-uv run --active python main.py
 💡 Telegram Usage Guide
 Approving Drafts: Click [ ✅ Send Reply ] under the draft summary to dispatch the email immediately via Gmail API.
 
