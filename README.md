@@ -56,8 +56,8 @@ A Telegram Bot token obtained from @BotFather and your personal Telegram chat_id
 
 2. Clone the Repository
 Bash
-git clone [https://github.com/](https://github.com/)<YOUR_USERNAME>/<YOUR_REPO_NAME>.git
-cd <YOUR_REPO_NAME>
+git clone https://github.com/kasuvugopi-eng/gmail-ai-agent.git
+cd gmail-ai-agent
 3. Install Dependencies with uv
 Bash
 uv sync
@@ -98,4 +98,4 @@ Attaching Files: Swipe left or click Reply on any draft notification in Telegram
 Batch Trash: When promotional emails accumulate, click [ 🗑️ Delete All Promotional Mails ] to batch-move them into Gmail Trash.
 
 🔒 Security Notice
-Never commit credentials.json, token.json, or .env to version control. Ensure all sensitive tokens and local state files remain listed in .gitignore.
+Never commit credentials.json, token.json, or .env to version control. Ensure all sensitive tokens and local state files remain listed in .gitignore.   
