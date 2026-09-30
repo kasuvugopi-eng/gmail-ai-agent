@@ -1,0 +1,14 @@
+# Virtual Environment
+.venv/
+__pycache__/
+*.pyc
+
+# Sensitive Secrets & API Keys (DO NOT UPLOAD)
+.env
+credentials.json
+token.json
+
+# Local State & Temp Files
+processed_ids.json
+pending_trash.json
+temp_*
